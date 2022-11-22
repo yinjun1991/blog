@@ -55,7 +55,7 @@ func main() {
 
 安装之后，打开终端执行命令 `go version`
 
-![image.png](/static/images/golang-0/1_console.png)
+![image.png](images/1_console.png)
 
 看到上图类似的输出，就证明一切准备妥当了。
 
@@ -352,7 +352,7 @@ var slice3 = slice2[3:6]
 
 可以将 slice 看作是基于底层存储数组（下文简称为 buffer）的视图，如下图所示：
 
-![image.png](/static/images/golang-0/2_slice.png)
+![image.png](images/2_slice.png)
 
 理解这张图非常重要，slice 本身结构大致如下：
 
@@ -416,7 +416,7 @@ a1[0] = 100
 a2[0]	// 10
 ```
 
-![image.png](/static/images/golang-0/3_slice.png)
+![image.png](images/3_slice.png)
 
 看懂上图就明白了:
 

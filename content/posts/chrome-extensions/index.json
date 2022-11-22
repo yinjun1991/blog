@@ -1,0 +1,15 @@
+{
+  "id": "CHROME1",
+  "title": "chrome 插件开发指南",
+  "summary": "如何开发一款 chrome 插件",
+  "author": "june",
+  "date": "2021-3-12 11:00:00",
+  "origin": "",
+  "keywords": [
+    "chrome extensions",
+    "web extensions",
+    "browser extensions",
+    "extensions",
+    "chrome"
+  ]
+}
