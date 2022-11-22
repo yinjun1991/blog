@@ -1,0 +1,4 @@
+baseURL = 'https://yinjun.site/'
+languageCode = 'zh-cn'
+title = '写好代码'
+theme = 'ananke'
