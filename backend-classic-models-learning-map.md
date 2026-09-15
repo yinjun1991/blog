@@ -65,7 +65,7 @@
 重复执行会产生额外副作用？→ Idempotency / Deduplication
 多个服务各有本地事务？→ Saga；不要假装它是一个数据库事务
 
-读流量远大于写流量？→ 先索引，再考虑 Cache-Aside / Read Model
+读流量远大于写流量？→ 先索引，再考虑 Cache-Aside / 读副本 / Read Model
 一个页面需要多个慢下游？→ Fan-out / Fan-in + 共享 deadline
 深分页或数据持续变化？→ Keyset / Cursor Pagination
 单库写入或容量到达上限？→ 最后才考虑 Partition / Sharding
@@ -154,7 +154,23 @@ Worker 一般通过“原子认领 + 租约”取得任务。Worker 崩溃、租
 - 单进程、任务可丢：Spring `@Scheduled`、Go `go-co-op/gocron/v2`。
 - Java、需要持久化 trigger、集群与 misfire 策略：Quartz。
 - 已运行 Kubernetes、任务适合独立容器：Kubernetes CronJob；官方也明确要求 Job 幂等，因为控制器不能完全避免重复或漏掉边界情况。
-- 大量“每个订单一个未来时间”：写入支持 delayed job 的任务队列，或由扫描器按 `due_at` 批量入队；不要给每个订单创建操作系统 cron。
+- 业务延迟任务（大量对象各有未来的 `due_at`，如订单超时关闭）：不要给每个订单创建操作系统 cron，三条实现路线见下。
+
+**业务延迟任务的三条实现路线**：
+
+| 路线 | 机制 | 收益 | 代价 |
+| --- | --- | --- | --- |
+| 延迟消息 | 消息由 broker 持有，到点投递 | 不引入额外的表与 Worker；量大时吞吐好 | 无法与业务写入同一个事务，要与业务绑定需 Outbox + relay（5.4）；RocketMQ 4.x 只有固定延迟档位（5.x 才支持任意时刻）、SQS 上限 15 分钟、Kafka 无原生延迟；待投递消息不可查询 |
+| 延迟任务表 | 任务是一行记录，带 `scheduled_at`；Worker 按“原子认领 + 租约”执行（4.2） | 可与业务同事务入队（River `InsertTx`；JobRunr 开源版与 Asynq 不支持）；自带重试、退避、租约恢复、DLQ、按业务 ID 查询与手动重放；所有延迟行为共用一套机制 | 多一张任务表与一套 Worker；任务被静默丢失或误删时没有自愈，需要兜底扫描（5.6） |
+| 状态扫描 | 定时扫描业务表，命中后用条件更新执行 | 没有第二份事实源，漏扫下次自动补齐，天然自愈；实现最简 | 触发条件必须能用 `WHERE` 表达；每增一种延迟行为或副作用，业务表就多一组状态列和一个扫描分支 |
+
+**路线 2 与路线 3 的选择**：
+
+- 路线 3 的任务从业务状态推导，少一个事实源，但没有给任务本身留位置。以订单超时关闭为例：只需要关单时，一个扫描加条件更新就够；一旦要求“关闭后投递 Webhook 且失败退避重试”，订单表要长出 `webhook_state / webhook_attempts / webhook_next_at / webhook_last_error`，扫描多一个分支；再加“过期前 5 分钟提醒”又是一组列。需求每加一个，就是把任务队列的通用字段往业务表里复制一份，且每种任务类型各配一套扫描。
+- 选路线 3 需要同时满足：触发条件能用 `WHERE` 表达；任务类型一到两种；副作用少且失败可接受，或能从状态重新推导；不需要按任务查看错误、统计尝试与手动重放。
+- 任一不满足（需要退避重试、多种延迟行为、任务与业务行解耦，如独立的 Webhook 投递）则选路线 2：任务是一等实体，通用字段只有 `kind / payload / scheduled_at / state / attempt / last_error / unique_key`，新增延迟行为只是注册新的 `kind`。
+- 两条路线都靠执行时的条件更新（`WHERE status='CREATED' AND expires_at<=now()`）保证正确。触发和取消只决定“何时尝试一次”，不决定“这次尝试还算不算数”；取消与执行可能并发，取消不是正确性保障。
+- 常见组合：路线 2 负责准时与重试，外加低频宽扫描兜底修复任务静默丢失（5.6）；也可反过来让扫描器只做批量入队（减少任务表中未来任务的数量），执行、重试与观测仍归任务表。
 
 ### 4.4 Batch：有限数据集的分块、检查点与重启
 
@@ -222,6 +238,55 @@ WHERE id = :id AND status = 'CREATED' AND version = :version;
 
 补偿必须单独设计且幂等。`refund()` 不是 `charge()` 的数学逆操作：退款可能失败、手续费可能不可逆、发出的邮件也收不回来。
 
+**TCC（Try-Confirm-Cancel）**是让 Saga 补偿变简单的标准做法：把对稀缺资源的占用拆成两个阶段——Try（reserve）只占额度不动资源，Confirm 才真正生效，失败则 Cancel（release）归还额度。补偿从“语义逆操作”（退款、取消订单）退化为“把计数器挪回去”。
+
+以库存为例，表结构：
+
+```sql
+-- 可用额度 = total - reserved
+CREATE TABLE inventory (
+  sku_id   BIGINT PRIMARY KEY,
+  total    INT NOT NULL,
+  reserved INT NOT NULL DEFAULT 0
+);
+
+-- 预占流水：order_id 为幂等键，expire_at 为超时兜底
+CREATE TABLE reservation (
+  order_id  BIGINT,
+  sku_id    BIGINT,
+  qty       INT,
+  status    VARCHAR(16),  -- RESERVED / CONFIRMED / CANCELLED
+  expire_at TIMESTAMP,
+  PRIMARY KEY (order_id, sku_id)
+);
+```
+
+三个操作各是一条原子 UPDATE，并与流水状态变更放在同一个事务：
+
+```sql
+-- Try：条件更新一行原子完成“检查 + 占用”，防超卖；同事务插入流水（RESERVED）
+UPDATE inventory SET reserved = reserved + 3
+WHERE sku_id = 42 AND total - reserved >= 3;
+
+-- Confirm：流程末尾真正扣减；同事务把流水 RESERVED → CONFIRMED
+UPDATE inventory SET total = total - 3, reserved = reserved - 3
+WHERE sku_id = 42;
+
+-- Cancel：Saga 失败时的补偿，归还额度；同事务把流水 RESERVED → CANCELLED
+UPDATE inventory SET reserved = reserved - 3
+WHERE sku_id = 42;
+```
+
+单看 Cancel 的 UPDATE 并不幂等，执行两次会多还一份额度；幂等由流水状态条件保证——只有 `UPDATE reservation ... WHERE status = 'RESERVED'` 影响行数为 1 时才归还库存，否则说明已被处理。
+
+超时兜底：预占后进程崩溃，等不到 Confirm / Cancel，额度会泄漏。定时任务扫描 `status = 'RESERVED' AND expire_at < NOW()` 的记录执行 Cancel。
+
+要点：
+
+- 只用于真正的稀缺资源（占用有机会成本）；Confirm 放在 Saga 关键点之后、流程末端。
+- Try / Cancel 以 `order_id` 为幂等键，Saga 重试投递 Cancel 是安全的。
+- 现实同款：酒店“保留到今晚 6 点”、信用卡预授权（pre-auth → capture）。
+
 ### 4.7 Event Log / Stream：保存事实并由消费者独立推进
 
 **识别信号**：事件持续产生；多个消费者以不同速度独立处理；需要重放、分区扩展或保留历史。
@@ -280,6 +345,23 @@ idempotency_records
 UNIQUE(scope, idempotency_key)
 ```
 
+“是否重新执行”只看 key：唯一约束命中即返回存储响应，`request_hash` 不参与这个决策。两个字段回答不同的问题：
+
+- `idempotency_key`：操作身份。客户端生成、重试时复用（UUID 或 `order_id + "PAY"` 这类业务键），标识“这是哪一次逻辑操作”；去重完全由唯一约束承担。
+- `request_hash`：内容校验。服务端对方法、路径和规范化后的 body 计算，校验“同一 key 这次参数与首次是否相同”；每次重试会变的字段（时间戳、请求序号）不参与，否则合法重试会被误判。
+
+记录已存在时按参数与状态组合处理：
+
+| 本次 hash | state | 处理 |
+| --- | --- | --- |
+| 与首次一致 | succeeded / failed | 返回存储的响应，不执行 |
+| 与首次一致 | processing | 返回 409“执行中”，不并发执行 |
+| 不一致 | 任意 | 返回 409 / 422，不执行，也不返回旧响应 |
+
+去掉 hash 去重能力没有损失，差别只在 key 被误用时的失败模式：没有 hash，同 key 不同参数会把首次操作的响应返回给另一个操作，双方都察觉不到，是静默的错误结果；有 hash 则变成 4xx，可发现可修复。unique 约束防“重复执行”，hash 防“张冠李戴”——前者是正确性底线，后者是可发现性保险。
+
+因此内部 API、客户端可控且 key 按约定规则生成时，省略 hash 是合理简化；对第三方开放的 API 应保留，成本只是每次请求多算一次 hash 并与已读出的记录比对。hash 不一致的拒绝响应要写明“key 已被不同参数使用，请换新 key”，mismatch 率不是正常流量，应作为指标监控。反过来，不同 key 配相同参数是两次独立操作（用户买两次同样的商品），都必须执行——`request_hash` 不做去重，只有 key 定义操作边界。
+
 消息消费者可使用 Inbox：在同一数据库事务中插入 `(consumer, message_id)` 唯一记录并更新业务表；唯一冲突表示已处理。注意“去重记录先提交、业务更新后失败”会丢消息，所以两者必须同事务。
 
 ### 5.2 重试、退避、抖动与错误分类
@@ -293,7 +375,23 @@ UNIQUE(scope, idempotency_key)
 - `Retry-After`：下游明确给出时优先尊重。
 - 最终去向：失败状态、DLQ、告警与人工重放。
 
-重试前必须回答“上一次是否可能已经成功”。答案为“可能”时，只能使用同一个幂等键重试，或先向下游查询结果。
+**jitter 的做法**：同时失败的客户端会算出相同退避，形成同步的重试波峰；随机化就是把整齐的定时行为打散。设第 n 次退避为 `d = min(cap, base × 2^n)`：
+
+| 策略 | 公式 | 分布 |
+| --- | --- | --- |
+| Equal Jitter | `d/2 + rand(0, d/2)` | 铺在半区间，平均等待仍为 d |
+| Full Jitter | `rand(0, d)` | 铺满全区间，同时刻到达的客户端最少，默认首选 |
+| Decorrelated Jitter | `min(cap, rand(base, 上次 sleep × 3))` | 与自己上一次的间隔解耦，避免连续抽到小值 |
+
+实现要点：每次重试都重新随机，不是算一次存起来；base 取 100ms～1s，cap 取 10～60s；`Retry-After` 优先于自算退避，最多加小扰动防对齐。Resilience4j 用 `IntervalFunction.ofExponentialRandomBackoff`，Go 常用 `cenkalti/backoff` 加随机化。同一思想也用于缓存 TTL 扰动：都是给本会整齐发生的定时行为加噪声。
+
+重试前必须回答“上一次是否可能已经成功”。超时、连接重置和部分 `5xx` 属于**结果未知**：调用方没拿到结果，服务端可能已执行副作用。处理按优先级三选一：
+
+1. **幂等键（根本解法，见 5.1）**：重试复用同一幂等键，无需判断上次结果——已成功则服务端去重并返回存储结果，未成功则正常执行。Stripe 的 `Idempotency-Key`、支付的 `out_trade_no` 都属此类。
+2. **先查再试**：用提交时的业务 ID 查下游状态。已成功则采纳该结果继续流程；明确失败才可重试；processing 或不存在可能仍在途，等待窗口后再查或转对账。
+3. **记录 UNKNOWN，对账兜底**：下游两者都不支持时，把这次尝试落库为结果未知，由对账任务（5.6）事后与事实源比对修复；宁可晚确定，不要双倍副作用。
+
+“查不到”不严格等于“没执行”：第一次请求可能仍在下游处理中、尚不可见。最稳的组合是 1 + 2——先按业务 ID 查（快速路径），重试仍带幂等键（兜住竞态）。错误分类上，连接被拒绝（请求未发出）可确定未执行；超时和连接重置一律按未知处理，不要试图细分。
 
 ### 5.3 Timeout、Circuit Breaker、Bulkhead、Rate Limit、Backpressure
 
@@ -309,6 +407,8 @@ UNIQUE(scope, idempotency_key)
 
 Circuit Breaker 不限制并发，Retry 也不等于容错；它们经常要和 timeout、bulkhead 一起使用。
 
+表中固定阈值都是对容量的静态猜测：设小了浪费容量，设大了照样压垮下游。自适应并发限制把配额变成跟随下游真实能力的变量：按 Little's Law（并发 ≈ 吞吐 × 平均延迟）用实测吞吐和最小延迟估算初始配额，运行期比较当前延迟与基准延迟的梯度，过载时收缩、空闲时缓慢回升。Netflix concurrency-limits 是这类实现的代表；它限制的是在途请求数而不是速率，与 token bucket 互补。
+
 ### 5.4 Transactional Outbox：消除数据库与 MQ 双写窗口
 
 错误写法：
@@ -317,7 +417,7 @@ Circuit Breaker 不限制并发，Retry 也不等于容错；它们经常要和 
 提交订单 DB → 发布 OrderCreated
 ```
 
-进程在两步之间崩溃就会永久漏事件。Outbox 做法是在一个本地数据库事务里同时写订单和 outbox 行，再由 relay 发布：
+进程在两步之间崩溃就会永久漏事件。Outbox 做法是在一个本地数据库事务里同时写订单和 outbox 行，再由 relay（把 outbox 行从数据库读出、发送到 MQ 的组件）发布：
 
 ```text
 DB transaction: orders + outbox_events
@@ -326,6 +426,8 @@ DB transaction: orders + outbox_events
                          ↓
                         MQ
 ```
+
+relay 有两种实现：**Polling Publisher** 轮询 outbox 表，读出未发布的行，发出后标记（`SELECT ... WHERE published=false`）；**CDC** 不查表，由 Debezium 这类工具读数据库日志（WAL）捕获新增行。两者读同一张表，可以互相替换，业务事务与事件格式不变。
 
 Outbox 解决“不漏掉已提交业务对应的事件”，不自动解决重复。relay 在“MQ 已接受、outbox 尚未标记”时崩溃仍会重复发布，消费者必须幂等。
 
@@ -350,7 +452,27 @@ Outbox 解决“不漏掉已提交业务对应的事件”，不自动解决重�
 - 对象存储已有文件，数据库导出任务仍是 running。
 - outbox 已发布很久，但关键消费者没有处理记录。
 
+触发按延迟分层，成熟系统三层叠加，共用同一套比较与修复代码：
+
+| 模式 | 触发 | 覆盖范围 | 定位 |
+| --- | --- | --- | --- |
+| 定时全量 | 低频（如每日） | 全部历史或大时间窗 | 最终防线，发现一切漂移 |
+| 定时增量 | 高频（如每 10 分钟） | 最近滚动窗口 | 高吞吐日常核对 |
+| 事件触发查证 | 特定信号（UNKNOWN 结果、回调超时） | 单条记录 | 分钟级兜底，如支付结果未知 5 分钟后单查 |
+
+增量模式相邻窗口必须重叠，否则边界上的迟到提交和时钟偏移会漏检。执行形态就是 4.4 的 Batch：按 `(created_at, id)` keyset 游标翻事实源，速率限制保护被对账方，两边数据落临时表用 `FULL OUTER JOIN` / `EXCEPT` 找差异（支付机构的 T+1 对账文件是这一形态的原型），checkpoint 支持断点续跑。
+
 对账不是失败后的临时脚本，而是一等后台任务：有游标、速率限制、差异表、修复动作和审计记录。
+
+**为什么必须有差异表**：发现差异与修复差异在时间上解耦——修复可能要等人工判断、第三方配合或业务决策，当日未必能完成；持久化成待办，崩溃后不丢，重跑时不重复执行有副作用的修复。差异表以业务 key 做唯一约束，让再次发现变成更新尝试次数而不是重复告警；它同时是人工查询入口、审计底稿和 `unresolved count`、最老未处理时长的度量来源。它与 DLQ、UNKNOWN 记录同构：处理不了、不能丢、待处置的东西，持久化成带状态机的行，而不是放在内存或日志里。
+
+**差异表是候选清单，不是修复指令**。表里存的是发现时刻的快照，而迟到事件可能已到、重试可能已成功、人工可能已修，拿过期快照无条件写入会修错。三层防御：
+
+1. **修复前重验**：修复时刻重新查两边状态，差异已消失标记 `self_resolved`，仍存在才修。修复写成条件更新，影响行数为 0 即放弃；人工修复后遗留的 `pending` 同样被重验覆盖。
+2. **差异分级**：transient（in-flight 交易、迟到事件、projection 滞后）超过观察期才升级，否则下轮重验自动关闭；permanent（掉单、金额不符）才进修复流程。没有分级，最终一致性的正常滞后会淹没有效告警。
+3. **修复方式优先重放**：以事实源为准重算该 key（重投影、重放事件），而不是携带快照目标值的 patch——重放天然基于当前状态。
+
+快照用于发现问题，重验决定是否修，条件更新保证写对；“修复必须幂等”防的不只是重复执行，也是基于过期数据的修复。
 
 ### 5.7 Poison Message、DLQ 与 Redrive
 
@@ -460,9 +582,9 @@ resident_memory ≈ active_tasks × per_task_working_set
 
 Go 1.25 在 Linux 容器内默认让 `GOMAXPROCS` 感知 cgroup CPU limit，但 CPU request 不是 limit；显式覆盖后要自行保证正确。`GOMEMLIMIT` 是 GC 的软限制，不是防 OOM 的硬墙，应为非 Go 内存和瞬时峰值保留余量。Kubernetes CPU limit 通常表现为 throttling，memory limit 超出后可能由内核 OOM kill；应用内预算和基础设施 limit 两层都需要。
 
-## 7. 五种数据访问与扩展模型
+## 7. 六种数据访问与扩展模型
 
-### 6.1 Cache-Aside + Singleflight：缓存读取与防击穿
+### 7.1 Cache-Aside + Singleflight：缓存读取与防击穿
 
 **识别信号**：少量热点数据被反复读取，数据库延迟或连接数成为瓶颈，并且业务允许一个明确的短暂陈旧窗口。
 
@@ -486,15 +608,117 @@ GET cache
 
 **成熟实现**：Java 可用 Spring Cache + Caffeine（本地）或 Spring Data Redis；Go 可用 Caffeine 思路的本地缓存库、`go-redis`，进程内重复调用抑制用 `golang.org/x/sync/singleflight`。框架只提供机制，key、TTL、一致性和失效仍是业务设计。
 
-### 6.2 CQRS + Materialized View：为写入和查询建立不同模型
+### 7.2 读写分离：应用代码如何选择实例
+
+**识别信号**：读吞吐是瓶颈，缓存与索引优化后仍不够，但写吞吐单库可承受；数据库提供 primary + read replica（PostgreSQL 流复制的副本只读）。
+
+路由决策封装在 repository / DAO 层：业务代码只调用 Repo 方法，感知不到实例存在。分片场景的路由（`tenant_id → shard`）遵循同一条边界，见 7.5 与项目八。读写分离的路由规则只有三条，按优先级：
+
+1. **事务内一律主库**：副本只读，写会直接报错；且事务里的读必须看到自己未提交的写，没有例外。
+2. **read-your-writes**：用户写完立刻读，副本可能尚未回放。三选一必须明确：会话粘性（写后 N 秒内该用户读主库）、LSN 等待（提交时记录 `pg_current_wal_lsn()`，读副本前确认 `pg_last_wal_replay_lsn()` 已追过该位置）、接受旧值（报表、他人的数据）。这与 7.3 CQRS 的 projection 一致性是同一个三选一，只是等待对象从 projection 换成副本回放。
+3. **其余读走副本**。
+
+```go
+// 数据访问层内部，唯一知道有多个实例的地方
+func (r *Router) db(ctx context.Context, mode Mode) *sql.DB {
+    if txFrom(ctx) != nil {
+        return r.primary // 事务内一律主库
+    }
+    if mode == Read && !r.sticky.needsPrimary(ctx) {
+        return r.replica
+    }
+    return r.primary
+}
+
+func (r *OrderRepo) ListByUser(ctx context.Context, userID string) ([]Order, error) {
+    return queryOrders(ctx, r.router.db(ctx, Read), userID) // 读意图在 Repo 方法上声明
+}
+```
+
+`sticky.needsPrimary` 在多实例下必须是共享状态：用户的写在实例 A 提交，下一次读可能落在实例 B，进程内存互相看不见。生产默认 Redis boolean + TTL，而不是时间戳：
+
+```go
+// 写事务提交后；SET 失败不能让写失败，只是丢掉副本分流
+redis.Set(ctx, "ryw:"+userID, "1", 3*time.Second)
+// 读路由时
+needsPrimary, _ := redis.Exists(ctx, "ryw:"+userID).Result()
+```
+
+TTL 即粘性窗口：`EXISTS` 只依赖 Redis 自身过期，不受跨机器时钟偏移影响，也免去内存 map 的过期淘汰；Redis 不可用时一律读主库，fail-safe 朝主库。进程内存只在单实例或 LB 会话亲和下正确，且滚动发布、重启都会打破亲和。这与 7.1 Singleflight 的多实例问题是同一模式：进程内状态在集群里都需要共享的权威版本。
+
+LSN 等待比粘性窗口精确，因为它把“写后 N 秒”换成“副本是否追上我的提交位置”。LSN（Log Sequence Number）是 WAL 的字节偏移量：提交不直接改数据文件，而是先把修改追加进 WAL、日志落盘即提交；流复制把这些字节发给副本按序重放，所以“副本有没有我的写”就是两个数字的比较：
+
+```text
+0/1000  BEGIN; UPDATE orders SET status='PAID' WHERE id=1001
+0/1080  COMMIT ← 你的提交，pg_current_wal_lsn() = 0/1080
+0/1120  别的事务提交
+副本 pg_last_wal_replay_lsn() = 0/1180 → 已回放过你的提交，读副本安全
+                            = 0/1050 → 未追上，等待或读主库
+```
+
+落地分三步：
+
+```go
+// 1. 写侧：commit 之后取位置。commit record 在提交那一刻才写入 WAL，
+//    提交前取到的是下界，副本可能追过它却没追到你的 commit，会误判已追上
+func (r *OrderRepo) Create(ctx context.Context, o Order) (CommitPos, error) {
+    // ...事务写入并提交...
+    var lsn string
+    r.primary.QueryRowContext(ctx, `SELECT pg_current_wal_lsn()`).Scan(&lsn)
+    return CommitPos(lsn), nil // >= 本次提交位置的安全上界
+}
+
+// 2. 读侧：在副本上比较。LSN 是 "0/16B3748" 形式的十六进制，字典序不可靠，必须相减取字节差
+func replicaCaughtUp(ctx context.Context, replica *sql.DB, pos CommitPos) bool {
+    var diff float64
+    err := replica.QueryRowContext(ctx,
+        `SELECT pg_last_wal_replay_lsn() - $1::pg_lsn`, string(pos)).Scan(&diff)
+    return err == nil && diff >= 0 // 检查只是函数求值，不读表，数据新旧无关
+}
+
+// 3. 路由：短暂轮询，超上限读主库
+func (r *Router) dbForRead(ctx context.Context, pos CommitPos) *sql.DB {
+    if pos == "" {
+        return r.replica // 本次无前置写入
+    }
+    deadline := time.Now().Add(200 * time.Millisecond)
+    for !replicaCaughtUp(ctx, r.replica, pos) {
+        if time.Now().After(deadline) {
+            return r.primary
+        }
+        time.Sleep(5 * time.Millisecond)
+    }
+    return r.replica
+}
+```
+
+多副本时可以不连副本：在主库查 `pg_stat_replication`（每个副本一行，`replay_lsn` 即其回放位置），一次挑出已追上的副本。轮询间隔 5–10ms 足够；等待上限要远小于请求 deadline，超了读主库，别把请求拖死在等待上。
+
+WAL 本质是 PostgreSQL 内建的 Event Log（见 4.7），LSN 相当于 Kafka 的 consumer offset，`pg_last_wal_replay_lsn()` 就是副本的消费进度。提交位置可存 Redis，也可放进 session 或签名 cookie 由客户端带回，省掉服务端共享状态。
+
+托管数据库通常直接提供 writer / reader endpoint（如 Aurora 的 cluster endpoint），应用配置两个 DSN，路由就是上面几行。gorm 的 DBResolver 插件、Java ShardingSphere 提供声明式配置。PgBouncer 不做路由，它只是连接池。
+
+### 7.3 CQRS + Materialized View：为写入和查询建立不同模型
 
 **识别信号**：写侧需要规范化数据和严格不变量，但读侧需要跨表聚合、搜索、排序或直接适配页面 DTO。
+
+CQRS（Command Query Responsibility Segregation，命令查询职责分离）：写操作和读操作各自使用自己的模型，而不是共用一套表结构和 DAO。矛盾用项目六的数据最容易看清。写侧的规范化结构为不变量服务——订单拆成多行明细，才能校验“金额 = 明细之和”、修改单个明细数量而不重写整单：
+
+```text
+orders(id, user_id, status, created_at)
+order_items(order_id, product, qty, price)
+payments(order_id, method, paid_at)
+```
+
+但运营页面需要每单一行的宽视图：状态筛选、时间排序、总金额、支付方式。共用这套表意味着每次翻页都执行三表 JOIN + GROUP BY。一个模型同时服务两种形状，写侧嫌它多余，读侧嫌它不够。
 
 CQRS 的最低成本形式只是代码层分离：Command 修改聚合，Query 返回专用 DTO，仍使用同一个数据库。只有读写负载、schema 或存储技术确实不同，才拆成独立 read store：
 
 ```text
 Command → Write Model → Outbox/Event → Projector → Read Model → Query
 ```
+
+Read model 长成页面需要的形状。项目六的 `order_list_projection(order_id, user_id, status, total_amount, pay_method, created_at)` 每单一行，`total_amount` 由 Projector 预先算好；运营页面退化为单表 SELECT，过滤和排序字段的复合索引也直接对应页面行为。
 
 Materialized View 是预先计算的查询结果，可以是 PostgreSQL materialized view、普通 projection 表、Redis 结构或搜索索引。独立 read model 通常最终一致，必须定义：
 
@@ -503,9 +727,9 @@ Materialized View 是预先计算的查询结果，可以是 PostgreSQL material
 - read model 损坏后能否从事实源重建？重建期间怎样提供服务？
 - schema 变更是原地迁移，还是建立 `v2` projection 后切流？
 
-**不要默认组合 Event Sourcing**。普通数据库当前状态 + Outbox 已能支撑大量 CQRS 场景。
+**不要默认组合 Event Sourcing**。普通数据库当前状态 + Outbox（见 5.4）已能支撑大量 CQRS 场景。
 
-### 6.3 Keyset / Cursor Pagination：稳定而高效地继续读取
+### 7.4 Keyset / Cursor Pagination：稳定而高效地继续读取
 
 `LIMIT/OFFSET` 适合数据少、页数浅、需要跳到任意页的后台界面。深分页时数据库仍要计算并跳过前面的行；并发插入/删除还可能导致重复或漏项。
 
@@ -526,7 +750,7 @@ LIMIT :page_size;
 - Cursor 是不透明 token，编码排序值、方向和必要的查询版本；服务端校验，客户端不要拼 SQL 值。
 - 过滤条件不能在翻页中途变化；需要稳定快照时还要额外定义一致性边界。
 
-### 6.4 Partition / Sharding / Consistent Hashing：把容量边界显式化
+### 7.5 Partition / Sharding / Consistent Hashing：把容量边界显式化
 
 **识别信号**：经过索引优化、归档、纵向扩容、缓存与读副本后，单库的写吞吐、存储或维护窗口仍达到硬边界。
 
@@ -543,7 +767,7 @@ Consistent Hashing 更常用于缓存节点或无状态分区，减少节点增�
 
 分片是长期架构成本，不是数据库慢的第一解法。
 
-### 6.5 Event Sourcing：以不可变事件作为事实源
+### 7.6 Event Sourcing：以不可变事件作为事实源
 
 普通审计日志是在当前状态之外记录“谁改了什么”；Event Sourcing 则不直接覆盖当前状态，而是追加领域事件，并通过 replay 得到状态：
 
@@ -571,10 +795,11 @@ AccountOpened → MoneyDeposited → MoneyWithdrawn → current balance
 | 接口快速返回，稍后完成一个动作 | 持久化 Job Queue | `new Thread` / 裸 goroutine |
 | 单机缓存每分钟清理，丢一次无所谓 | 进程内 scheduler | 部署分布式调度平台 |
 | 集群每天生成唯一账单 | 持久化 scheduler → 幂等 Job | 每个副本 `@Scheduled` 直接做业务 |
+| 大量对象各有未来到期时间（如订单超时关闭） | 延迟任务表；简单场景用状态扫描 + 条件更新 | 给每个对象创建 cron、只靠取消任务保证正确 |
 | 数百万行日终处理 | Batch + chunk + checkpoint | 一个大事务、一次全读入内存 |
 | 等待付款/审批数天 | Durable Workflow | 数据库状态 + 大量散落回调和 cron |
 | DB 更新后可靠通知其他服务 | Transactional Outbox | DB commit 后直接 publish |
-| 跨服务业务事务 | Saga + 幂等 + 补偿 | 分布式大事务作为默认方案 |
+| 跨服务业务事务 | Saga + 幂等 + 补偿；稀缺资源用 TCC 预占 | 分布式大事务作为默认方案 |
 | 多消费者独立消费并可重放 | Event Stream | 把流当普通工作队列 |
 | 多 Worker 抢数据库任务 | `FOR UPDATE SKIP LOCKED` + lease | `SELECT` 后再无条件 `UPDATE` |
 | 多租户任务共享 Worker | 分队列配额 + Weighted Fairness | 只用一个全局 Priority Queue |
@@ -586,6 +811,7 @@ AccountOpened → MoneyDeposited → MoneyWithdrawn → current balance
 | 防止同一请求重复创建资源 | Idempotency Key + unique constraint | 先查再插 |
 | 修复罕见漏事件/未知结果 | Reconciliation | 假设主链路永不失效 |
 | 热点读取压垮数据库 | Cache-Aside + Singleflight | 给所有查询无差别加缓存 |
+| 读多写少且缓存已到位，写吞吐未到上限 | 读写分离 + read-your-writes 三选一 | 不定义一致性策略就读副本 |
 | 写模型合理但页面查询复杂 | CQRS + Materialized View | 为页面破坏写侧不变量和范式 |
 | 大数据列表持续翻页 | Keyset / Cursor Pagination | 深 `OFFSET` 分页 |
 | 一个请求查询多个独立下游 | 有界 Fan-out / Fan-in | 无界 goroutine / 公共线程池 |
@@ -601,6 +827,8 @@ AccountOpened → MoneyDeposited → MoneyWithdrawn → current balance
 ### 项目一：可靠的延迟任务服务
 
 **目标**：订单创建 30 分钟未支付则关闭；支付后立即阻止关闭；关闭后异步发送 Webhook。
+
+**路线选择**：业务延迟任务的三条实现路线与适用条件见 4.3。本项目选延迟任务表：流程 3～5 的 Webhook 投递需要退避重试与 DLQ，且任务入队必须与订单写入同一个事务。
 
 **建议栈**：
 
@@ -663,7 +891,7 @@ AccountOpened → MoneyDeposited → MoneyWithdrawn → current balance
 
 **目标**：订单事务提交后可靠发布 `OrderCreated`；积分与通知两个消费者独立处理；支持重放和对账。
 
-**建议栈**：PostgreSQL + Debezium Outbox Event Router + Kafka。若暂时不想部署 CDC，第一版可用 polling publisher，第二版再替换 relay，业务事务与事件 schema 不变。
+**建议栈**：PostgreSQL + Debezium Outbox Event Router + Kafka。若暂时不想部署 CDC，第一版可用 polling publisher 实现 relay，第二版再替换为 CDC 实现；两种实现读同一张 outbox 表，业务事务与事件 schema 不变。
 
 **Outbox 关键字段**：
 
@@ -1011,15 +1239,35 @@ sink/LateReadingSink.java
 
 ## 11. 利用本目录已有源码学习
 
-当前目录已有三个很好的实现样本：
+实现样本（river 与 rocketmq 在 `codes/` 目录，Asynq 需自行克隆）：
 
-- [`river`](./river)：先读 `riverdriver/riverpgxv5/internal/dbsqlc/river_job.sql` 中的 `FOR UPDATE SKIP LOCKED`，再读 `internal/jobexecutor/job_executor.go` 的成功/失败状态转换、`internal/leadership/doc.go` 的数据库租约。
-- [`asynq`](./asynq)：先读 `processor.go` 的 dequeue、lease 与成功确认，再读 `recoverer.go` 如何回收 lease 过期任务，最后看 `internal/base/base.go` 的 Redis key 与任务状态。
-- [`rocketmq`](./rocketmq)：先从 `store/.../CommitLog` 与 consumer queue 的关系理解“顺序追加日志 + 派生消费索引”，不要一开始逐包通读整个项目。
+- [`codes/river`](./codes/river)：先读 `riverdriver/riverpgxv5/internal/dbsqlc/river_job.sql` 中的 `FOR UPDATE SKIP LOCKED`，再读 `internal/jobexecutor/job_executor.go` 的成功/失败状态转换、`internal/leadership/doc.go` 的数据库租约。
+- [asynq](https://github.com/hibiken/asynq)：先读 `processor.go` 的 dequeue、lease 与成功确认，再读 `recoverer.go` 如何回收 lease 过期任务，最后看 `internal/base/base.go` 的 Redis key 与任务状态。
+- [`codes/rocketmq`](./codes/rocketmq)：先从 `store/.../CommitLog` 与 consumer queue 的关系理解“顺序追加日志 + 派生消费索引”，不要一开始逐包通读整个项目。
 
 源码阅读采用固定问题，而不是按文件顺序阅读：任务如何原子认领？Worker 死亡怎样发现？重试时间放哪？完成状态何时写？旧 Worker 是否可能晚到写入？指标和管理入口在哪里？完成项目十时再增加四个问题：fetch 是否受并发空位约束？prefetch 的 payload 存在哪里？停机先停止哪一层？执行池饱和后任务去哪？
 
-## 12. 二十二周学习顺序
+第 5.3 节的可靠性机制另有两个值得克隆精读的小型经典库，体量在数小时内可读完：
+
+- [Netflix concurrency-limits](https://github.com/Netflix/concurrency-limits)：自适应并发限制。读 `concurrency-limits-core` 的 `Gradient` 与 `AIMD` limiter。固定问题：基准最小延迟如何更新？梯度超过阈值时配额如何收缩？恢复时按什么速率回升？拒绝时给调用方的信号是什么？
+- [sony/gobreaker](https://github.com/sony/gobreaker)：最小实现的 Circuit Breaker。对照 5.3 的状态机读。固定问题：half-open 如何限制探测并发？计数窗口是计数型还是时间型？状态转换在哪个锁内完成？
+
+## 12. 开源业务项目参考
+
+第 11 章读的是 library 源码，本章看业务代码如何组合这些 library 与模式（以下项目 2026 年均活跃维护）。按地图章节配对阅读，而不是按仓库顺序通读；每个项目都从“钱和状态变化的路径”切入——下单 → 支付 → 取消/退款，看事务边界在哪、幂等键是什么、失败怎么补偿。
+
+- [wild-workouts-go-ddd-example](https://github.com/ThreeDotsLabs/wild-workouts-go-ddd-example)（Go，健身房约课）：DDD + Clean Architecture + CQRS 的完整业务实现，业务代码在 `internal/`，command / query 服务分离。配套免费书 *Go With The Domain* 与[组合三模式的重构文章](https://threedots.tech/post/ddd-cqrs-clean-architecture-combined/)。对应 7.3。
+- [ftgo-application](https://github.com/microservices-patterns/ftgo-application)（Java，餐饮外卖）：《Microservices Patterns》配套项目。`ftgo-order-service` 的 saga 目录读 CreateOrderSaga / CancelOrderSaga 的补偿事务，`ftgo-order-history-service` 是 CQRS read model（对应项目六）。注意 outbox 机制在依赖框架 eventuate-tram 内，本项目展示的是业务如何组合框架。对应 4.6、5.4、7.3。
+- [medusa](https://github.com/medusajs/medusa)（TypeScript，电商平台）：真实商城 core。重点读 v2 的 `workflows-sdk`——带 compensation 的 saga 式工作流引擎——以及 event bus 和 Stripe 风格的 idempotency-keys 模块。语言非 Go / Java，但是“电商平台把 saga / 幂等做成基础设施”的最佳参考。对应 4.6、5.1。
+- [temporalio/samples-go](https://github.com/temporalio/samples-go)（Go）：durable workflow 示例全家桶，`saga/` 含 rollback 补偿，另有 schedules、mutex、wait-for-signal、child-workflow。对应 4.5、项目三。
+- [debezium-examples](https://github.com/debezium/debezium-examples)（Java / Quarkus）：CDC + Transactional Outbox 的标准参考（订单 → outbox 表 → Debezium tail WAL → Kafka），与 7.2 的 LSN / WAL 直接衔接，配套[官方文章](https://debezium.io/blog/2019/02/19/reliable-microservices-data-exchange-with-the-outbox-pattern/)。对应 5.4。
+- [confluentinc/kafka-streams-examples](https://github.com/confluentinc/kafka-streams-examples)（Java）：流表 join、窗口聚合、exactly-once 的官方示例。对应 4.7、6.2。
+- [killbill/killbill](https://github.com/killbill/killbill)（Java，订阅计费）：真实处理钱的系统，复杂度高，作为进阶。读法：追一条“支付回调 → invoice 生成 → 通知”链路，看持久化通知队列（4.2、4.3）、支付重试与幂等（5.1）、订阅状态机（4.6）、对账（5.6）。
+- [microservices-demo](https://github.com/GoogleCloudPlatform/microservices-demo)（Go，Online Boutique）：11 个 Go 微服务，业务薄，看 checkout 的 fan-out 结构与整体工程结构。对应项目七。
+
+国内流行的 macrozheng/mall（Java）业务全（订单流程、秒杀、RabbitMQ 死信延迟取消、Redis 锁、ES 搜索），但属教学向 CRUD：先查后写、隐式状态机、幂等不严格。适合看商城业务全貌与中间件接线；也可用本地图的标准逐条挑毛病作为练习，不要当正确性范本。
+
+## 13. 二十二周学习顺序
 
 | 周 | 主题 | 产出 |
 | --- | --- | --- |
@@ -1054,8 +1302,9 @@ sink/LateReadingSink.java
 - shard 路由变化后，旧实例能否把数据写到错误位置？
 - 旧消息、旧 Workflow 与新代码是否兼容？
 - 失败任务由谁发现，怎样查询、告警、修复和重放？
+- 对账发现差异到执行修复之间事实源可能已变，修复依据的是快照还是当前状态？
 
-## 13. 官方资料索引
+## 14. 官方资料索引
 
 按学习顺序阅读，先读概念和失败语义，再读 Quickstart：
 
@@ -1067,6 +1316,8 @@ sink/LateReadingSink.java
 - [Go：GC 与 `GOMEMLIMIT`](https://go.dev/doc/gc-guide)
 - [Kubernetes：CPU / Memory request 与 limit](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/)
 - [Resilience4j：Retry、Circuit Breaker、Bulkhead 等模块](https://resilience4j.readme.io/docs/getting-started)
+- [Netflix concurrency-limits：自适应并发限制与 gradient limiter](https://github.com/Netflix/concurrency-limits)
+- [sony/gobreaker：最小实现的 Circuit Breaker](https://github.com/sony/gobreaker)
 - [AWS：Exponential Backoff and Jitter](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/)
 - [Stripe：Idempotent Requests](https://docs.stripe.com/api/idempotent_requests)
 - [PostgreSQL `SELECT`：`SKIP LOCKED` 适用于 queue-like table](https://www.postgresql.org/docs/current/sql-select.html)
@@ -1103,7 +1354,7 @@ sink/LateReadingSink.java
 - [Redis：Distributed Locks 与 fencing token 提醒](https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/)
 - [OpenTelemetry：Traces、Metrics、Logs](https://opentelemetry.io/docs/concepts/signals/)
 
-## 14. 最后形成的判断习惯
+## 15. 最后形成的判断习惯
 
 遇到新需求时，不先搜索“Java/Go 怎么实现某功能”，先写出：
 
