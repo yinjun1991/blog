@@ -1,7 +1,7 @@
 # 01｜River 架构鸟瞰
 
-- 目标：以鸟瞰视角理解 River（`github.com/riverqueue/river` v0.47.0，源码在 `codes/river/`）的整体架构、主要模块与数据流，回答两个问题：它能做什么、是怎么做到的。
-- 适配：Go + PostgreSQL；自顶向下分层展开，先架构全貌，再数据模型，再三条核心数据流，最后模块速览与能力清单。
+- 目标：以鸟瞰视角理解 River（`github.com/riverqueue/river` v0.47.0，源码在 `../../codes/river/`）的整体架构、主要模块与数据流，回答两个问题：它能做什么、是怎么做到的。
+- 适配：Go + PostgreSQL；自顶向下分层展开：最小使用示例 → 架构全貌 → 数据模型 → 三条核心数据流 → 模块速览与能力清单。
 
 ## 1. 定位与设计哲学
 
@@ -9,7 +9,96 @@ River 是 Go + PostgreSQL 的任务队列：**用已有的 Postgres 存任务，
 
 一个进程里的 Client 同时承担两个角色：**生产者**（调用 `Insert` 入队）和**消费者**（内部 producer 拉取并执行 Worker）。
 
-## 2. 顶层架构
+## 2. 最小使用示例
+
+一个可运行的完整例子（依赖 `river`、`riverdriver/riverpgxv5`、`pgx` v5）：
+
+```go
+package main
+
+import (
+    "context"
+    "log"
+    "os"
+    "os/signal"
+
+    "github.com/jackc/pgx/v5/pgxpool"
+    "github.com/riverqueue/river"
+    "github.com/riverqueue/river/riverdriver/riverpgxv5"
+    "github.com/riverqueue/river/rivermigrate"
+)
+
+// 任务参数：struct 序列化为 JSON 存进 river_job.args
+type SendWelcomeEmailArgs struct {
+    UserID int64 `json:"user_id"`
+}
+
+// Kind 是任务类型标识，存进 river_job.kind，按它匹配到对应 Worker
+func (SendWelcomeEmailArgs) Kind() string { return "send_welcome_email" }
+
+// Worker：只写执行逻辑，中间件/重试时间等有默认实现
+type SendWelcomeEmailWorker struct {
+    river.WorkerDefaults[SendWelcomeEmailArgs]
+}
+
+func (w *SendWelcomeEmailWorker) Work(ctx context.Context, job *river.Job[SendWelcomeEmailArgs]) error {
+    log.Printf("sending welcome email to user %d", job.Args.UserID)
+    return nil // 返回 error 则按 retry policy 进入 retryable
+}
+
+func main() {
+    ctx := context.Background()
+
+    dbPool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    // 建表（river_job 等）；生产环境一般并入应用自身的迁移流程
+    migrator, err := rivermigrate.New(riverpgxv5.New(dbPool), nil)
+    if err != nil {
+        log.Fatal(err)
+    }
+    if _, err := migrator.Migrate(ctx, rivermigrate.DirectionUp, nil); err != nil {
+        log.Fatal(err)
+    }
+
+    workers := river.NewWorkers()
+    river.AddWorker(workers, &SendWelcomeEmailWorker{})
+
+    client, err := river.NewClient(riverpgxv5.New(dbPool), &river.Config{
+        Queues: map[string]river.QueueConfig{
+            "default": {MaxWorkers: 10},
+        },
+        Workers: workers,
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    // 启动运行时：producer/elector/维护服务全部在本进程内以 goroutine 运行
+    if err := client.Start(ctx); err != nil {
+        log.Fatal(err)
+    }
+
+    // 入队：普通插入；需要和业务写库同事务时改用 InsertTx(ctx, tx, args, nil)
+    if _, err := client.Insert(ctx, SendWelcomeEmailArgs{UserID: 42}, nil); err != nil {
+        log.Fatal(err)
+    }
+
+    // 优雅停机：等在跑的任务结束；要强制取消在跑任务则用 StopAndCancel
+    sigctx, stop := signal.NotifyContext(ctx, os.Interrupt)
+    defer stop()
+    <-sigctx.Done()
+    if err := client.Stop(context.Background()); err != nil {
+        log.Fatal(err)
+    }
+}
+```
+
+与后文的对应关系：`Insert` 走 5.1 的入队流；`Work` 由 producer 抢到任务后经 jobexecutor 调用（5.2 的消费流）；选主与维护服务（5.3）由 `Start` 自动带起，业务代码无感。
+
+## 3. 顶层架构
 
 ```mermaid
 flowchart TB
@@ -57,7 +146,7 @@ flowchart TB
 
 关键分层：**根包**是对外 API，**internal** 是运行时机制，**riverdriver** 把所有 SQL 抽象成 `Executor` 接口（约 40 个操作，见 [river_driver_interface.go](../../codes/river/riverdriver/river_driver_interface.go)），所以同一套核心逻辑可以跑在 pgx、database/sql、SQLite 上。
 
-## 3. 核心数据模型：river_job 状态机
+## 4. 核心数据模型：river_job 状态机
 
 所有机制都围绕 `river_job` 表的一个状态字段（[river_job.sql](../../codes/river/riverdriver/riverpgxv5/internal/dbsqlc/river_job.sql)）：
 
@@ -80,9 +169,9 @@ stateDiagram-v2
 
 表上的其他字段支撑对应功能：`priority`（1-4）、`queue`、`unique_key + unique_states`（唯一性）、`errors jsonb[]`（每次失败的错误历史）、`metadata`（取消标记等）、`finalized_at`（终态时间，配套 CHECK 约束保证一致性）。
 
-## 4. 数据流
+## 5. 数据流
 
-### 4.1 入队（生产者侧）
+### 5.1 入队（生产者侧）
 
 ```mermaid
 sequenceDiagram
@@ -105,7 +194,7 @@ sequenceDiagram
 - **正常路径靠 LISTEN/NOTIFY 唤醒，轮询做兜底**（producer 有 jitter 轮询循环，所以 notify 丢失只是延迟、不丢任务；驱动不支持 LISTEN 时退化为纯轮询模式）
 - 事务内插入意味着**提交前其他消费者看不到这条任务**，天然原子
 
-### 4.2 消费（producer → executor → completer）
+### 5.2 消费（producer → executor → completer）
 
 ```mermaid
 flowchart LR
@@ -133,7 +222,7 @@ flowchart LR
 - **jobexecutor**（[internal/jobexecutor](../../codes/river/internal/jobexecutor/)）：单任务生命周期——中间件、hook、超时控制、出错时按 retry policy 算下次执行时间、卡死检测
 - **jobcompleter**（[internal/jobcompleter](../../codes/river/internal/jobcompleter/)）：把执行结果**异步批量**写回 DB（`JobSetStateIfRunning` 只在任务仍是 running 时生效，防止覆盖人工取消等并发操作），并驱动事件流
 
-### 4.3 维护（选主 + Leader 独占的后台服务）
+### 5.3 维护（选主 + Leader 独占的后台服务）
 
 多客户端实例中同时只能有一个 Leader 运行维护任务，避免重复劳动：
 
@@ -157,7 +246,7 @@ flowchart TB
 
 选主不是为任务分发（那是 `SKIP LOCKED` 干的），只为**去重跑后台维护**：搬到期任务、清理垃圾、跑 cron。Leader 挂掉后 lease 过期，follower 秒级接管。
 
-## 5. 模块速览
+## 6. 模块速览
 
 | 模块 | 位置 | 核心功能 |
 |---|---|---|
@@ -172,7 +261,7 @@ flowchart TB
 | rivertype | `codes/river/rivertype/` | 跨包共享类型：`JobRow`、状态常量、hook/插件接口 |
 | rivermigrate / rivertest | 根下子模块 | 迁移管理 / 测试断言工具 |
 
-## 6. 由架构推出的能力清单
+## 7. 由架构推出的能力清单
 
 对照上面的机制，River 开箱提供：
 
@@ -191,6 +280,6 @@ flowchart TB
 | 优雅停机（等任务跑完 vs 强制取消） | `Stop` / `StopAndCancel` 两段式关闭 |
 | 自定义中间件、hook、错误处理器、重试策略 | jobexecutor 的扩展点（middleware / hook 接口） |
 
-## 7. 一句话总结
+## 8. 一句话总结
 
 **River = 一张带状态机的 `river_job` 表 + 抢占式消费循环 + LISTEN/NOTIFY 加速唤醒 + 每实例一个的 Leader 维护后台**。所有可靠性保证（不丢、不重跑调度错乱、崩溃恢复）最终都落在 Postgres 的事务和行锁语义上。
