@@ -194,6 +194,25 @@ sequenceDiagram
 - **正常路径靠 LISTEN/NOTIFY 唤醒，轮询做兜底**（producer 有 jitter 轮询循环，所以 notify 丢失只是延迟、不丢任务；驱动不支持 LISTEN 时退化为纯轮询模式）
 - 事务内插入意味着**提交前其他消费者看不到这条任务**，天然原子
 
+#### 通知为什么由 client 发，而不是触发器
+
+早期版本（迁移 002）用数据库触发器实现唤醒：`river_job` 上的 AFTER INSERT 触发器，新行 state 为 `available` 时 `pg_notify('river_insert', {queue})`。004 迁移删掉了触发器，通知职责移到 client 侧的 Go 代码（`Insert` 完成后、同一事务连接上调 `NotifyMany`）。
+
+触发器方案的两个问题：
+
+- **无法限制频率**：Postgres 只去重同一事务内完全相同的通知，所以每个插入事务至少发一条 notify。高频小事务下通知量与事务数成正比，容易刷成通知风暴
+- **每行过一次触发器函数**：批量插入按行数放大执行开销
+
+client 侧的替代实现（client.go 的 `maybeNotifyInsertForQueues`）：
+
+- **内存限流**：进程内的 `notifylimiter`（`map[队列]上次发送时间` + 一把锁），间隔小于 `FetchCooldown` 就不发——producer 本来就不会比冷却期更频繁地 fetch，通知发得更快是浪费
+- **原子性保留**：`pg_notify` 在事务内调用时随 commit 才投递、回滚不发，所以在插入的同一事务上发送，语义与触发器等价
+- **多队列一次往返**：payload 拼成数组，一条 `unnest` + `pg_notify` 语句批量发出
+
+限流只到实例级、不做跨实例协调，这是刻意的 ROI 取舍：`pg_notify` 是广播、唤醒幂等——任何一条通知叫醒的是**所有**实例的 producer，多实例重复发送只是冗余而非错误；全局通知速率的上界 = 实例数 × 队列数 / 冷却窗口，与插入速率无关（触发器方案的致命处正是通知量 ∝ 插入事务数、没有上界）。为全局去重引入跨实例协调（如 Redis）成本远超收益——何况被限流掉的插入并不丢，最多晚一个轮询周期被兜底捞起。
+
+代价是覆盖面收窄：触发器对**任何写入方**生效（包括绕过 River 直插 `river_job` 的工具），client 侧只覆盖走 API 的插入——第三方直插靠 producer 轮询兜底（最坏约 1s 延迟）。
+
 ### 5.2 消费（producer → executor → completer）
 
 ```mermaid
@@ -244,7 +263,60 @@ flowchart TB
     end
 ```
 
-选主不是为任务分发（那是 `SKIP LOCKED` 干的），只为**去重跑后台维护**：搬到期任务、清理垃圾、跑 cron。Leader 挂掉后 lease 过期，follower 秒级接管。
+#### 选主机制：单行租约的抢、续、让
+
+`river_leader` 是一张**单行租约表**：INSERT 抢位、UPDATE 续约、过期释放。`name` 列是 PRIMARY KEY 且 CHECK 死等于 `'default'`——全库最多一行，即全局唯一的 Leader 槽位。
+
+当选是一条原子 INSERT（每个实例的 elector 默认每 5s 尝试一次）：
+
+```sql
+INSERT INTO river_leader(leader_id, elected_at, expires_at)
+VALUES (@leader_id, now(), now() + @ttl)   -- ttl 默认 15s
+ON CONFLICT (name) DO NOTHING
+RETURNING *;
+```
+
+有返回行即当选；冲突被 `DO NOTHING` 吞掉即本轮落选。尝试前先在同一个事务里 `LeaderDeleteExpired` 清掉过期死行，前任的过期租约不挡路。
+
+Leader 持续续约（默认每 5s 一次），SQL 带三重防护：
+
+```sql
+UPDATE river_leader SET expires_at = now() + @ttl
+WHERE elected_at = @elected_at      -- 只认自己这个任期（fencing）
+  AND expires_at >= now()           -- 租约未过期
+  AND leader_id = @leader_id;
+```
+
+`elected_at` 兼任任期号：租约过期被别人顶替后，新行的任期不同，旧 Leader 的续约必然落空，无法"复活"自己；续约失败或超时，Leader 主动让位并停掉维护服务。TTL 默认 15s = 选主间隔 5s + 10s 余量。
+
+崩溃切换的时间线（默认值）：
+
+```text
+t=0    A INSERT 成功当选，expires_at = t+15s
+t=5s   A 续约 → t+20s；t=10s 再续 → t+25s
+t=12s  A 进程崩溃，续约停止，死行仍在
+t=25s  租约过期，B 的 elect 循环 DeleteExpired + INSERT 当选
+```
+
+崩溃场景最坏约 20s（TTL + 一个选主间隔），维护任务幂等所以无伤。优雅停机走快路径：`LeaderResign` 在删行的同时 `pg_notify('river_leadership', {action: 'resigned'})`，follower LISTEN 到广播立刻抢位，不等过期。
+
+两个设计取舍：
+
+- **UNLOGGED 表**：领导权本来就是"进程活着才有效"的状态，崩溃即失权，无需持久化，还省 WAL
+- **表租约 vs advisory lock**：advisory lock 只表达"持/不持"，绑定连接生命周期，查不到当前 Leader 是谁、何时当选、何时过期；租约行是可见的数据——`expires_at` 是显式 TTL，`elected_at` 提供任期 fencing，`leader_id` 标识持有者，排障时一条 SELECT 看清全局
+
+（UNLOGGED 表与 advisory lock 的机制细节展开在 [pg.md](../../pg.md)）
+
+选主不是为任务分发（那是 `SKIP LOCKED` 干的），只为**去重跑后台维护**：搬到期任务、清理垃圾、跑 cron。
+
+#### 卡死检测：`attempted_at` 为什么够用
+
+rescuer 判定僵尸任务的条件是 `state='running' AND attempted_at < now() - 窗口`，执行期间没有任何心跳刷新。这成立的前提是"卡死"的两种故障已被分层处理：
+
+- **Work 挂起**（死循环、外部调用不返回，进程还活着）：jobexecutor 的 `watchStuck` + JobTimeout（默认 1 分钟）在进程内超时取消 context，轮不到 DB 层
+- **进程死亡**（OOM、kill -9，无人写回终态）：合法任务最长跑 JobTimeout，"开始时间超过窗口仍 running"即可断定进程已死。窗口默认 1h，配置更大的 JobTimeout 时自动抬为 `JobTimeout + 1h`（[client.go](../../codes/river/client.go)）
+
+`attempted_at` 在抢任务的同一个 UPDATE 里顺手写入，执行期间零额外写。心跳方案（执行期间周期刷新 `touched_at`，如 BullMQ 锁续期、Temporal activity heartbeat）面向**时长无界**的任务——无法声明 JobTimeout，只能靠"还在跳"证明活着；代价是每个运行中任务的定时写放大，且框架心跳检测不出 Work 级挂起（心跳 goroutine 活着就照跳），JobTimeout 依然省不掉。SQS 的 VisibilityTimeout 与 River 同构，同样不做心跳。**任务时长有界可声明 → `attempted_at`；支持无界长任务 → 心跳**——这是任务时长模型的选择，不是口味差异。
 
 ## 6. 模块速览
 
